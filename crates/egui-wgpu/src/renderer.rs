@@ -240,6 +240,10 @@ pub struct Renderer {
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
 
+    /// Set when the last [`Self::update_buffers`] could not upload the vertex or index data,
+    /// e.g. because the device was lost. [`Self::render`] then draws nothing.
+    buffer_upload_failed: bool,
+
     uniform_buffer: wgpu::Buffer,
     previous_uniform_buffer_content: UniformBuffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -479,6 +483,7 @@ impl Renderer {
                 slices: Vec::with_capacity(64),
                 capacity: INDEX_BUFFER_START_CAPACITY,
             },
+            buffer_upload_failed: false,
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer::zeroed(),
@@ -501,6 +506,9 @@ impl Renderer {
     /// The only consequence of `forget_lifetime` is that any operation on the parent encoder will cause a runtime error
     /// instead of a compile time error.
     ///
+    /// If [`Renderer::update_buffers`] failed to upload the data (e.g. because the device was lost),
+    /// this draws nothing.
+    ///
     /// # Panic
     /// Always ensure that [`Renderer::update_buffers`] has been called otherwise calling [`Renderer::render`] will panic!
     pub fn render(
@@ -510,6 +518,10 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) {
         profiling::function_scope!();
+
+        if self.buffer_upload_failed {
+            return;
+        }
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
         let size_in_pixels = screen_descriptor.size_in_pixels;
@@ -961,6 +973,9 @@ impl Renderer {
     /// Should be called before [`Self::render`].
     ///
     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
+    ///
+    /// If the data can't be uploaded (e.g. because the device was lost), an error is logged,
+    /// no callbacks are prepared, and the next call to [`Self::render`] draws nothing.
     pub fn update_buffers(
         &mut self,
         device: &wgpu::Device,
@@ -1030,11 +1045,16 @@ impl Renderer {
             );
 
             let Some(mut index_buffer_staging) = index_buffer_staging else {
-                panic!(
-                    "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
-                    self.index_buffer.buffer.size(),
-                    self.index_buffer.capacity
-                );
+                // wgpu returns `None` e.g. when the device has been lost (driver reset, GPU removed, etc.).
+                if !self.buffer_upload_failed {
+                    log::error!(
+                        "Failed to create staging buffer for index data, skipping rendering. Was the device lost? Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                        self.index_buffer.buffer.size(),
+                        self.index_buffer.capacity
+                    );
+                }
+                self.buffer_upload_failed = true;
+                return Vec::new();
             };
 
             let mut index_offset = 0;
@@ -1076,11 +1096,16 @@ impl Renderer {
             );
 
             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
-                panic!(
-                    "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
-                    self.vertex_buffer.buffer.size(),
-                    self.vertex_buffer.capacity
-                );
+                // wgpu returns `None` e.g. when the device has been lost (driver reset, GPU removed, etc.).
+                if !self.buffer_upload_failed {
+                    log::error!(
+                        "Failed to create staging buffer for vertex data, skipping rendering. Was the device lost? Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                        self.vertex_buffer.buffer.size(),
+                        self.vertex_buffer.capacity
+                    );
+                }
+                self.buffer_upload_failed = true;
+                return Vec::new();
             };
 
             let mut vertex_offset = 0;
@@ -1099,6 +1124,7 @@ impl Renderer {
                 }
             }
         }
+        self.buffer_upload_failed = false;
 
         let mut user_cmd_bufs = Vec::new();
         {
@@ -1273,3 +1299,104 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draw_frame(
+        renderer: &mut Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        paint_jobs: &[epaint::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut command_buffers =
+            renderer.update_buffers(device, queue, &mut encoder, paint_jobs, screen_descriptor);
+        {
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations::default(),
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            renderer.render(&mut render_pass, paint_jobs, screen_descriptor);
+        }
+        command_buffers.push(encoder.finish());
+        queue.submit(command_buffers);
+    }
+
+    /// Once the device is lost, `Queue::write_buffer_with` returns `None`.
+    /// That should skip the frame, not panic.
+    #[test]
+    fn lost_device_does_not_panic() {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = Renderer::new(&device, format, RendererOptions::default());
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut mesh = epaint::Mesh::default();
+        mesh.add_colored_rect(
+            epaint::Rect::from_min_size(epaint::Pos2::ZERO, epaint::vec2(8.0, 8.0)),
+            epaint::Color32::WHITE,
+        );
+        let paint_jobs = [epaint::ClippedPrimitive {
+            clip_rect: epaint::Rect::EVERYTHING,
+            primitive: Primitive::Mesh(mesh),
+        }];
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [16, 16],
+            pixels_per_point: 1.0,
+        };
+
+        draw_frame(
+            &mut renderer,
+            &device,
+            &queue,
+            &view,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        assert!(!renderer.buffer_upload_failed);
+
+        device.destroy();
+
+        draw_frame(
+            &mut renderer,
+            &device,
+            &queue,
+            &view,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        assert!(renderer.buffer_upload_failed);
+    }
+}
